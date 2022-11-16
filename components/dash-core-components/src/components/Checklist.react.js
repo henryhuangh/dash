@@ -44,6 +44,7 @@ export default class Checklist extends Component {
                                 inline ? {display: 'inline-block'} : {}
                             )}
                             className={labelClassName}
+                            title={option.title}
                         >
                             <input
                                 checked={includes(option.value, value)}
