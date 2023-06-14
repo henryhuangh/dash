@@ -15,7 +15,6 @@ import hashlib
 import base64
 import traceback
 from urllib.parse import urlparse
-from textwrap import dedent
 
 import flask
 
@@ -64,8 +63,10 @@ from ._grouping import map_grouping, grouping_len, update_args_group
 
 from . import _pages
 from ._pages import (
-    _parse_path_variables,
     _parse_query_string,
+    _page_meta_tags,
+    _path_to_page,
+    _import_layouts_from_pages,
 )
 
 # Add explicit mapping for map files
@@ -119,13 +120,14 @@ _ID_DUMMY = "_pages_dummy"
 try:
     page_container = html.Div(
         [
-            dcc.Location(id=_ID_LOCATION),
-            html.Div(id=_ID_CONTENT),
+            dcc.Location(id=_ID_LOCATION, refresh="callback-nav"),
+            html.Div(id=_ID_CONTENT, disable_n_clicks=True),
             dcc.Store(id=_ID_STORE),
-            html.Div(id=_ID_DUMMY),
+            html.Div(id=_ID_DUMMY, disable_n_clicks=True),
         ]
     )
-except AttributeError:
+# pylint: disable-next=bare-except
+except:  # noqa: E722
     page_container = None
 
 
@@ -199,13 +201,17 @@ class Dash:
         requested.
     :type assets_folder: string
 
-    :param pages_folder: a path, relative to the current working directory,
-        for pages of a multi-page app. Default ``'pages'``.
-    :type pages_folder: string
+    :param pages_folder: a relative or absolute path for pages of a multi-page app.
+        Default ``'pages'``.
+    :type pages_folder: string or pathlib.Path
 
-    :param use_pages:  Default False, or True if you set a non-default ``pages_folder``.
-        When True, the ``pages`` feature for multi-page apps is enabled.
-    :type pages: boolean
+    :param use_pages: When True, the ``pages`` feature for multi-page apps is
+        enabled. If you set a non-default ``pages_folder`` this will be inferred
+        to be True. Default `None`.
+    :type use_pages: boolean
+
+    :param include_pages_meta: Include the page meta tags for twitter cards.
+    :type include_pages_meta: bool
 
     :param assets_url_path: The local urls for assets will be:
         ``requests_pathname_prefix + assets_url_path + '/' + asset_path``
@@ -328,6 +334,9 @@ class Dash:
     :param background_callback_manager: Background callback manager instance
         to support the ``@callback(..., background=True)`` decorator.
         One of ``DiskcacheManager`` or ``CeleryManager`` currently supported.
+
+    :param add_log_handler: Automatically add a StreamHandler to the app logger
+        if not added previously.
     """
 
     def __init__(  # pylint: disable=too-many-statements
@@ -336,12 +345,13 @@ class Dash:
         server=True,
         assets_folder="assets",
         pages_folder="pages",
-        use_pages=False,
+        use_pages=None,
         assets_url_path="assets",
         assets_ignore="",
         assets_external_path=None,
         eager_loading=False,
         include_assets_files=True,
+        include_pages_meta=True,
         url_base_pathname=None,
         requests_pathname_prefix=None,
         routes_pathname_prefix=None,
@@ -360,6 +370,7 @@ class Dash:
         update_title="Updating...",
         long_callback_manager=None,
         background_callback_manager=None,
+        add_log_handler=True,
         **obsolete,
     ):
         _validate.check_obsolete(obsolete)
@@ -411,6 +422,7 @@ class Dash:
             extra_hot_reload_paths=extra_hot_reload_paths or [],
             title=title,
             update_title=update_title,
+            include_pages_meta=include_pages_meta,
         )
         self.config.set_read_only(
             [
@@ -420,6 +432,7 @@ class Dash:
                 "eager_loading",
                 "serve_locally",
                 "compress",
+                "pages_folder",
             ],
             "Read-only: can only be set in the Dash constructor",
         )
@@ -431,8 +444,8 @@ class Dash:
         _get_paths.CONFIG = self.config
         _pages.CONFIG = self.config
 
-        self.pages_folder = pages_folder
-        self.use_pages = True if pages_folder != "pages" else use_pages
+        self.pages_folder = str(pages_folder)
+        self.use_pages = (pages_folder != "pages") if use_pages is None else use_pages
 
         # keep title as a class property for backwards compatibility
         self.title = title
@@ -480,8 +493,10 @@ class Dash:
         self._long_callback_count = 0
         self._background_manager = background_callback_manager or long_callback_manager
 
-        self.logger = logging.getLogger(name)
-        self.logger.addHandler(logging.StreamHandler(stream=sys.stdout))
+        self.logger = logging.getLogger(__name__)
+
+        if not self.logger.handlers and add_log_handler:
+            self.logger.addHandler(logging.StreamHandler(stream=sys.stdout))
 
         if isinstance(plugins, patch_collections_abc("Iterable")):
             for plugin in plugins:
@@ -795,14 +810,13 @@ class Dash:
 
         mode = "dev" if self._dev_tools["props_check"] is True else "prod"
 
-        deps = []
-        for js_dist_dependency in _dash_renderer._js_dist_dependencies:
-            dep = {}
-            for key, value in js_dist_dependency.items():
-                dep[key] = value[mode] if isinstance(value, dict) else value
-
-            deps.append(dep)
-
+        deps = [
+            {
+                key: value[mode] if isinstance(value, dict) else value
+                for key, value in js_dist_dependency.items()
+            }
+            for js_dist_dependency in _dash_renderer._js_dist_dependencies
+        ]
         dev = self._dev_tools.serve_dev_bundles
         srcs = (
             self._collect_and_register_resources(
@@ -845,67 +859,24 @@ class Dash:
     def _generate_renderer(self):
         return f'<script id="_dash-renderer" type="application/javascript">{self.renderer}</script>'
 
-    def _generate_meta_html(self):
-        meta_tags = self.config.meta_tags
+    def _generate_meta(self):
+        meta_tags = []
         has_ie_compat = any(
-            x.get("http-equiv", "") == "X-UA-Compatible" for x in meta_tags
+            x.get("http-equiv", "") == "X-UA-Compatible" for x in self.config.meta_tags
         )
-        has_charset = any("charset" in x for x in meta_tags)
-        has_viewport = any(x.get("name") == "viewport" for x in meta_tags)
+        has_charset = any("charset" in x for x in self.config.meta_tags)
+        has_viewport = any(x.get("name") == "viewport" for x in self.config.meta_tags)
 
-        tags = []
         if not has_ie_compat:
-            tags.append('<meta http-equiv="X-UA-Compatible" content="IE=edge">')
+            meta_tags.append({"http-equiv": "X-UA-Compatible", "content": "IE=edge"})
         if not has_charset:
-            tags.append('<meta charset="UTF-8">')
+            meta_tags.append({"charset": "UTF-8"})
         if not has_viewport:
-            tags.append(
-                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            meta_tags.append(
+                {"name": "viewport", "content": "width=device-width, initial-scale=1"}
             )
 
-        tags += [format_tag("meta", x, opened=True) for x in meta_tags]
-
-        return "\n      ".join(tags)
-
-    def _pages_meta_tags(self):
-        start_page, path_variables = self._path_to_page(flask.request.path.strip("/"))
-
-        # use the supplied image_url or create url based on image in the assets folder
-        image = start_page.get("image", "")
-        if image:
-            image = self.get_asset_url(image)
-        assets_image_url = (
-            "".join([flask.request.url_root, image.lstrip("/")]) if image else None
-        )
-        supplied_image_url = start_page.get("image_url")
-        image_url = supplied_image_url if supplied_image_url else assets_image_url
-
-        title = start_page.get("title", self.title)
-        if callable(title):
-            title = title(**path_variables) if path_variables else title()
-
-        description = start_page.get("description", "")
-        if callable(description):
-            description = (
-                description(**path_variables) if path_variables else description()
-            )
-
-        return dedent(
-            f"""
-            <meta name="description" content="{description}" />
-            <!-- Twitter Card data -->
-            <meta property="twitter:card" content="summary_large_image">
-            <meta property="twitter:url" content="{flask.request.url}">
-            <meta property="twitter:title" content="{title}">
-            <meta property="twitter:description" content="{description}">
-            <meta property="twitter:image" content="{image_url}">
-            <!-- Open Graph data -->
-            <meta property="og:title" content="{title}" />
-            <meta property="og:type" content="website" />
-            <meta property="og:description" content="{description}" />
-            <meta property="og:image" content="{image_url}">
-            """
-        )
+        return meta_tags + self.config.meta_tags
 
     # Serve the JS bundles for each package
     def serve_component_suites(self, package_name, fingerprinted_path):
@@ -950,14 +921,14 @@ class Dash:
         scripts = self._generate_scripts_html()
         css = self._generate_css_dist_html()
         config = self._generate_config_html()
-        metas = self._generate_meta_html()
+        metas = self._generate_meta()
         renderer = self._generate_renderer()
 
         # use self.title instead of app.config.title for backwards compatibility
         title = self.title
-        pages_metas = ""
-        if self.use_pages:
-            pages_metas = self._pages_meta_tags()
+
+        if self.use_pages and self.config.include_pages_meta:
+            metas = _page_meta_tags(self) + metas
 
         if self._favicon:
             favicon_mod_time = os.path.getmtime(
@@ -974,8 +945,12 @@ class Dash:
             opened=True,
         )
 
+        tags = "\n      ".join(
+            format_tag("meta", x, opened=True, sanitize=True) for x in metas
+        )
+
         index = self.interpolate_index(
-            metas=pages_metas + metas,
+            metas=tags,
             title=title,
             css=css,
             config=config,
@@ -1156,7 +1131,7 @@ class Dash:
         self,
         *_args,
         manager=None,
-        interval=None,
+        interval=1000,
         running=None,
         cancel=None,
         progress=None,
@@ -1979,70 +1954,11 @@ class Dash:
 
         self.server.run(host=host, port=port, debug=debug, **flask_run_options)
 
-    def _import_layouts_from_pages(self):
-        walk_dir = self.config.pages_folder
-
-        for (root, dirs, files) in os.walk(walk_dir):
-            dirs[:] = [
-                d for d in dirs if not d.startswith(".") and not d.startswith("_")
-            ]
-            for file in files:
-                if (
-                    file.startswith("_")
-                    or file.startswith(".")
-                    or not file.endswith(".py")
-                ):
-                    continue
-                with open(os.path.join(root, file), encoding="utf-8") as f:
-                    content = f.read()
-                    if "register_page" not in content:
-                        continue
-
-                page_filename = os.path.join(root, file).replace("\\", "/")
-                _, _, page_filename = page_filename.partition(
-                    walk_dir.replace("\\", "/") + "/"
-                )
-                page_filename = page_filename.replace(".py", "").replace("/", ".")
-
-                pages_folder = (
-                    self.pages_folder.replace("\\", "/").lstrip("/").replace("/", ".")
-                )
-
-                module_name = ".".join([pages_folder, page_filename])
-
-                spec = importlib.util.spec_from_file_location(
-                    module_name, os.path.join(root, file)
-                )
-                page_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(page_module)
-
-                if (
-                    module_name in _pages.PAGE_REGISTRY
-                    and not _pages.PAGE_REGISTRY[module_name]["supplied_layout"]
-                ):
-                    _validate.validate_pages_layout(module_name, page_module)
-                    _pages.PAGE_REGISTRY[module_name]["layout"] = getattr(
-                        page_module, "layout"
-                    )
-
-    @staticmethod
-    def _path_to_page(path_id):
-        path_variables = None
-        for page in _pages.PAGE_REGISTRY.values():
-            if page["path_template"]:
-                template_id = page["path_template"].strip("/")
-                path_variables = _parse_path_variables(path_id, template_id)
-                if path_variables:
-                    return page, path_variables
-            if path_id == page["path"].strip("/"):
-                return page, path_variables
-        return {}, None
-
     def enable_pages(self):
         if not self.use_pages:
             return
         if self.pages_folder:
-            self._import_layouts_from_pages()
+            _import_layouts_from_pages(self.config.pages_folder)
 
         @self.server.before_request
         def router():
@@ -2064,9 +1980,7 @@ class Dash:
                 """
 
                 query_parameters = _parse_query_string(search)
-                page, path_variables = self._path_to_page(
-                    self.strip_relative_path(pathname)
-                )
+                page, path_variables = _path_to_page(self.strip_relative_path(pathname))
 
                 # get layout
                 if page == {}:
